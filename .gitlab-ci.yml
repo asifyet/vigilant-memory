@@ -1,0 +1,155 @@
+image: docker:latest
+
+services:
+  - docker:18.09-dind
+
+stages:
+  - test
+  - build
+  - package
+  - deploy
+
+variables:
+  DOCKER_DRIVER: overlay2
+  IMAGE_NAME: openplatform/chain
+  GIT_SUBMODULE_STRATEGY: recursive
+
+###########################
+# Tests
+###########################
+unit-tests:
+  stage: test
+  image: openjdk:12-jdk
+  before_script:
+    - export GRADLE_USER_HOME=`pwd`/.gradle
+  script:
+    - ./gradlew check -i
+  after_script:
+    - cat build/reports/jacoco/test/html/index.html
+  coverage: '/Total.*?([0-9]{1,3})%/'
+  cache:
+    paths:
+      - .gradle/wrapper
+      - .gradle/caches
+  artifacts:
+    when: always
+    paths:
+      - build/reports/
+    expire_in: 1 day
+
+###########################
+# Building
+###########################
+build-jar:
+  stage: build
+  image: openjdk:12-jdk
+  dependencies: []
+  before_script:
+    - export GRADLE_USER_HOME=`pwd`/.gradle
+  script:
+    - ./gradlew assemble
+  cache:
+    paths:
+      - .gradle/wrapper
+      - .gradle/caches
+  artifacts:
+    paths:
+      - build/libs/*.jar
+    expire_in: 1 day
+  only:
+    - sprint
+    - master
+    - tags
+
+###########################
+# Packaging
+###########################
+package-docker:
+  stage: package
+  dependencies:
+    - build-jar
+  script:
+    - if [[ ${CI_COMMIT_REF_NAME} == master ]]; then export IMAGE_TAG=latest; else export IMAGE_TAG=${CI_COMMIT_REF_NAME}; fi;
+    - docker login -u ${DOCKER_LOGIN} -p ${DOCKER_PASS}
+    - docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
+    - docker push ${IMAGE_NAME}:${IMAGE_TAG}
+  only:
+    - sprint
+    - master
+    - tags
+
+package-native:
+  stage: package
+  dependencies:
+    - build-jar
+  before_script:
+    - apk --no-cache add gettext
+    - export VERSION=$(echo ${CI_COMMIT_REF_NAME} | sed -e 's/v//')
+    - envsubst '${VERSION}' < install4j/multi.install4j > install4j/multi.install4j.new
+    - mv install4j/multi.install4j.new install4j/multi.install4j
+  script:
+    - mv build/libs/open-chain-*.jar build/libs/open-chain.jar
+    - |
+      docker run --rm -v "$(pwd):/packages" openplatform/install4j:full \
+            /JRE/install4j7.0.6/bin/install4jc --license=${INSTALL4J_KEY} \
+            /packages/install4j/multi.install4j
+  artifacts:
+    paths:
+      - artifacts/*
+    expire_in: 1 day
+  only:
+    - tags
+
+###########################
+# Deploy
+###########################
+.deploy-to-host-script: &deploy_to_host |
+  if [[ ${CI_COMMIT_REF_NAME} == master ]]; then export IMAGE_TAG=latest; else export IMAGE_TAG=${CI_COMMIT_REF_NAME}; fi
+  echo "${DEPLOY_KEY_PROD}" | tr -d '\r' > ansible/key.pem
+  chmod 600 ansible/key.pem
+  mkdir ansible/host_vars
+  for i in `seq 1 11`; do eval echo "key: \$SERVER${i}" >> ansible/host_vars/server${i}; done
+  # For 2 containers on one host.
+  for i in `seq 12 22`; do j=$(($i - 11)); eval echo "key2: \$SERVER${i}" >> ansible/host_vars/server${j}; done
+  ansible-playbook --private-key=ansible/key.pem -i ansible/inventory -f 11 -e "del_volume=${DELETE_VOLUME}" -e "image_tag=${IMAGE_TAG}" -e "count=11" -e "user_login=${DEPLOY_USER_PROD}" ansible/deploy.yml
+
+copy-packages:
+  stage: deploy
+  dependencies:
+    - package-native
+  before_script:
+    - apk --no-cache add rsync openssh-client
+    - echo "${DEPLOY_KEY_OPEN}" | tr -d '\r' > key.pem
+    - chmod 600 key.pem
+  script:
+    - rsync -avzhO --no-p --delete -e "ssh -i key.pem -o StrictHostKeyChecking=no" artifacts/ ${DEPLOY_USER_PROD}@openfuture.io:/var/www/updates.openfuture.io/
+  only:
+    - tags
+
+deploy:
+  stage: deploy
+  image: openplatform/ansible
+  dependencies: []
+  variables:
+    ANSIBLE_HOST_KEY_CHECKING: "False"
+    DELETE_VOLUME: "false"
+  script:
+    - *deploy_to_host
+  when: manual
+  only:
+    - master
+    - tags
+
+deploy-delete-volume:
+  stage: deploy
+  image: openplatform/ansible
+  dependencies: []
+  variables:
+    ANSIBLE_HOST_KEY_CHECKING: "False"
+    DELETE_VOLUME: "true"
+  script:
+    - *deploy_to_host
+  when: manual
+  only:
+    - master
+    - tags
